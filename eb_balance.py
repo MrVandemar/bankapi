@@ -7,6 +7,7 @@ Subcommands:
   link              one-time consent flow -> stores session + account UIDs
   fetch             fetch balances for linked accounts -> SQLite (run from cron, <=4x/day)
   latest            print latest cached balances as JSON
+  notify            fetch one balance and publish a daily allowance to local ntfy
   serve             tiny read-only HTTP endpoint (Bearer token) serving cached balances
 
 Config via env vars (or a .env you `source`):
@@ -15,20 +16,27 @@ Config via env vars (or a .env you `source`):
   EB_REDIRECT_URL   redirect URL registered on the app (e.g. https://your-domain/eb-callback)
   EB_DB             SQLite path (default: ./balances.db)
   EB_API_TOKEN      bearer token required by `serve` (generate: python3 -c "import secrets;print(secrets.token_urlsafe(32))")
+  EB_ACCOUNT_UID    linked account UID used by `notify`
+  NTFY_URL          local ntfy server URL (default: http://127.0.0.1:2586)
+  NTFY_TOPIC        private ntfy topic
+  NTFY_TOKEN        ntfy token with write access to the topic
 
 Deps: pip install requests "pyjwt[crypto]"
 """
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from hmac import compare_digest
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import jwt
 import requests
@@ -141,6 +149,32 @@ def pick_balance(balances):
     return balances[0] if balances else None
 
 
+class BalanceUnavailable(Exception):
+    pass
+
+
+def fetch_account_balance(uid):
+    r = requests.get(f"{API}/accounts/{uid}/balances", headers=auth_headers(), timeout=30)
+    if r.status_code in (401, 403, 422):
+        raise BalanceUnavailable(f"consent expired/invalid ({r.status_code}) — re-run `link`.")
+    r.raise_for_status()
+    balance = pick_balance(r.json().get("balances", []))
+    if not balance:
+        raise BalanceUnavailable("no balances returned")
+    return balance
+
+
+def save_balance(conn, uid, balance, fetched_at):
+    amt = balance["balance_amount"]
+    with conn:
+        conn.execute(
+            "INSERT INTO balance (uid, fetched_at, balance_type, amount, currency, reference_date) "
+            "VALUES (?,?,?,?,?,?)",
+            (uid, fetched_at, balance.get("balance_type"), amt["amount"], amt["currency"],
+             balance.get("reference_date")),
+        )
+
+
 def cmd_fetch(args):
     conn = db()
     accounts = conn.execute("SELECT uid, iban FROM account").fetchall()
@@ -148,22 +182,13 @@ def cmd_fetch(args):
         sys.exit("No linked accounts — run `link` first.")
     now = datetime.now(timezone.utc).isoformat()
     for uid, iban in accounts:
-        r = requests.get(f"{API}/accounts/{uid}/balances", headers=auth_headers(), timeout=30)
-        if r.status_code in (401, 403, 422):
-            print(f"[{iban}] consent expired/invalid ({r.status_code}) — re-run `link`.", file=sys.stderr)
-            continue
-        r.raise_for_status()
-        b = pick_balance(r.json().get("balances", []))
-        if not b:
-            print(f"[{iban}] no balances returned", file=sys.stderr)
+        try:
+            b = fetch_account_balance(uid)
+        except BalanceUnavailable as exc:
+            print(f"[{iban}] {exc}", file=sys.stderr)
             continue
         amt = b["balance_amount"]
-        with conn:
-            conn.execute(
-                "INSERT INTO balance (uid, fetched_at, balance_type, amount, currency, reference_date) "
-                "VALUES (?,?,?,?,?,?)",
-                (uid, now, b.get("balance_type"), amt["amount"], amt["currency"], b.get("reference_date")),
-            )
+        save_balance(conn, uid, b, now)
         print(f"[{iban}] {amt['amount']} {amt['currency']} ({b.get('balance_type')})")
 
     # warn when consent is about to lapse
@@ -193,6 +218,70 @@ def latest():
 
 def cmd_latest(args):
     print(json.dumps(latest(), indent=2))
+
+
+def daily_allowance(amount, today):
+    try:
+        balance = Decimal(amount)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Invalid balance amount") from None
+    if not balance.is_finite():
+        raise ValueError("Invalid balance amount")
+    if today.day < 10:
+        target = date(today.year, today.month, 10)
+    elif today.month == 12:
+        target = date(today.year + 1, 1, 10)
+    else:
+        target = date(today.year, today.month + 1, 10)
+    numerator, denominator = balance.as_integer_ratio()
+    return numerator // (denominator * (target - today).days * 2)
+
+
+def cmd_notify(args):
+    uid = env("EB_ACCOUNT_UID")
+    topic = env("NTFY_TOPIC")
+    token = env("NTFY_TOKEN")
+    server = os.environ.get("NTFY_URL", "http://127.0.0.1:2586")
+    parsed = urlparse(server)
+    if (parsed.scheme not in ("http", "https") or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        sys.exit("NTFY_URL must be a loopback server URL with no path, query, or credentials.")
+    try:
+        parsed.port
+    except ValueError:
+        sys.exit("NTFY_URL has an invalid port.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", topic):
+        sys.exit("NTFY_TOPIC must contain only letters, numbers, underscores, and hyphens.")
+
+    conn = db()
+    if not conn.execute("SELECT 1 FROM account WHERE uid = ?", (uid,)).fetchone():
+        sys.exit("Configured account is not linked.")
+    try:
+        balance = fetch_account_balance(uid)
+        amount = daily_allowance(balance["balance_amount"]["amount"],
+                                 datetime.now(ZoneInfo("Europe/Bratislava")).date())
+        save_balance(conn, uid, balance, datetime.now(timezone.utc).isoformat())
+    except BalanceUnavailable as exc:
+        sys.exit(str(exc))
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        sys.exit(f"Could not fetch a valid balance ({type(exc).__name__}).")
+
+    with requests.Session() as session:
+        session.trust_env = False
+        try:
+            response = session.post(
+                f"{server.rstrip('/')}/{topic}",
+                data=f"You have {amount} for today".encode("utf-8"),
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+                allow_redirects=False,
+            )
+            if not 200 <= response.status_code < 300:
+                sys.exit(f"ntfy publish failed (HTTP {response.status_code}).")
+        except requests.RequestException:
+            sys.exit("ntfy publish failed (connection error).")
+    print("Notification accepted by ntfy.")
 
 
 def cmd_serve(args):
@@ -238,6 +327,7 @@ def main():
 
     sp.add_parser("fetch").set_defaults(fn=cmd_fetch)
     sp.add_parser("latest").set_defaults(fn=cmd_latest)
+    sp.add_parser("notify").set_defaults(fn=cmd_notify)
 
     s = sp.add_parser("serve")
     s.add_argument("--host", default="127.0.0.1", help="keep on localhost / Tailscale IP; don't bind 0.0.0.0")
