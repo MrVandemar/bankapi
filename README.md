@@ -15,14 +15,22 @@ access and each subscriber read access. Protect the server and its tokens;
 ntfy's default anonymous access is not suitable for financial information.
 The script only publishes to `127.0.0.1`, not to a public ntfy server.
 
-For remote iPhone access, choose a private encrypted network or VPN that
-connects both iPhones to the Termux device and verify that the server is
-reachable over it. The existing Cloudflare SSH tunnel alone does not provide
-that access. Avoid an HTTP proxy that can read the notification body. Verify
-the chosen network and ntfy server work on the Android/Termux device before
-relying on them; Android background and networking restrictions can stop
-services. Install the ntfy iOS app on both iPhones, configure the private server
-and credentials, subscribe to the same topic, and enable notifications.
+`NTFY_BASE_URL=https://ntfy.<domain> sh setup_ntfy.sh` (run once, in Termux)
+builds ntfy natively for Android, writes `~/.config/ntfy/server.yml` unless it
+already exists, creates a write-only `publisher` user and token,
+writes `NTFY_*` to `.env` and adds a termux-services entry (`sv-enable ntfy`).
+`test_ntfy.sh` checks the local server without contacting the bank.
+
+Remote iPhone access uses the existing Cloudflare Tunnel: a public hostname
+`ntfy.<domain>` routes to `http://127.0.0.1:2586`, with `base-url` and
+`behind-proxy: true` set in `server.yml`. This is a deliberate trade-off:
+Cloudflare terminates TLS, so it can read the notification text and the phones'
+ntfy credentials, and the server is reachable from the internet, protected only
+by ntfy authentication (deny-all default, no signup, long random passwords).
+Cloudflare Access cannot be used because the ntfy iOS app cannot log in to it.
+Android background restrictions can stop Termux services. Install the ntfy iOS
+app on both iPhones, configure the server and a read-only user, subscribe to
+the topic, and enable notifications.
 
 For timely iOS notifications, ntfy's self-hosted server normally uses an
 [upstream wake-up relay](https://docs.ntfy.sh/config/#ios-instant-notifications).
@@ -46,9 +54,11 @@ file (see `.env.example`):
 
 Keep `.env` readable only by the owner. Never commit tokens, topic names or
 account identifiers. The existing Enable Banking credentials and a valid
-consent are also required. `notify` fetches the selected account directly and
-stores the new balance in SQLite. If fetching fails or the balance is invalid,
-it does not publish a cached value. If publishing fails, it reports an error
+consent are also required. If the selected account's latest stored balance was
+fetched today (Europe/Bratislava date, including by `fetch`), `notify` uses it
+without calling the bank; otherwise it fetches the account and stores the new
+balance in SQLite. `notify --force` always fetches. If fetching fails or the
+balance is invalid, it does not fall back to an older stored value. If publishing fails, it reports an error
 without retrying; server acceptance does not confirm delivery to either phone.
 
 Run manually after sourcing `.env`:
@@ -57,8 +67,9 @@ Run manually after sourcing `.env`:
 ./venv/bin/python eb_balance.py notify
 ```
 
-This sends a real notification and fetches from the bank. Stay within Enable
-Banking's fetch limits, including any other scheduled fetches.
+This sends a real notification and fetches from the bank unless the balance
+was already fetched today. Stay within Enable Banking's fetch limits, including
+any other scheduled fetches.
 
 ## Scheduling on Termux
 
@@ -74,7 +85,8 @@ entry for a checkout at `$HOME/bankapi` is:
 Adjust the path and Python interpreter for the Termux installation. Setting
 `TZ` only inside a cron job does not necessarily change when cron runs it:
 verify the daemon's time zone and daylight-saving behavior on the device.
-Ensure the Python installation has the `Europe/Bratislava` IANA time-zone data.
+Termux's Python has no IANA time-zone data; install it into the venv with
+`./venv/bin/pip install tzdata`, or `notify` fails with `ZoneInfoNotFoundError`.
 Configure the ntfy server and scheduler to restart after reboot, for example
 using [Termux:Boot](https://github.com/termux/termux-boot), and review Android
 battery restrictions and Termux process limits. Cron skips a run if the device

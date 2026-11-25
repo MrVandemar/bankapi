@@ -7,7 +7,8 @@ Subcommands:
   link              one-time consent flow -> stores session + account UIDs
   fetch             fetch balances for linked accounts -> SQLite (run from cron, <=4x/day)
   latest            print latest cached balances as JSON
-  notify            fetch one balance and publish a daily allowance to local ntfy
+  notify            publish a daily allowance to local ntfy, using today's stored
+                    balance if there is one, else fetching it (--force always fetches)
   serve             tiny read-only HTTP endpoint (Bearer token) serving cached balances
 
 Config via env vars (or a .env you `source`):
@@ -36,7 +37,7 @@ from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from hmac import compare_digest
 from urllib.parse import parse_qs, urlparse
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import jwt
 import requests
@@ -237,7 +238,28 @@ def daily_allowance(amount, today):
     return numerator // (denominator * (target - today).days * 2)
 
 
+LOCAL_TZ = "Europe/Bratislava"
+
+
+def stored_balance_for_day(conn, uid, day):
+    """Latest stored amount for uid if it was fetched on `day` (Bratislava date), else None."""
+    row = conn.execute(
+        "SELECT amount, fetched_at FROM balance WHERE uid = ? ORDER BY fetched_at DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        fetched = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if fetched.tzinfo is None:
+        return None
+    return row[0] if fetched.astimezone(ZoneInfo(LOCAL_TZ)).date() == day else None
+
+
 def cmd_notify(args):
+    force = getattr(args, "force", False)
     uid = env("EB_ACCOUNT_UID")
     topic = env("NTFY_TOPIC")
     token = env("NTFY_TOKEN")
@@ -258,21 +280,32 @@ def cmd_notify(args):
     if not conn.execute("SELECT 1 FROM account WHERE uid = ?", (uid,)).fetchone():
         sys.exit("Configured account is not linked.")
     try:
-        balance = fetch_account_balance(uid)
-        amount = daily_allowance(balance["balance_amount"]["amount"],
-                                 datetime.now(ZoneInfo("Europe/Bratislava")).date())
-        save_balance(conn, uid, balance, datetime.now(timezone.utc).isoformat())
-    except BalanceUnavailable as exc:
-        sys.exit(str(exc))
-    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
-        sys.exit(f"Could not fetch a valid balance ({type(exc).__name__}).")
+        today = datetime.now(ZoneInfo(LOCAL_TZ)).date()
+    except ZoneInfoNotFoundError:
+        sys.exit(f"Time-zone data for {LOCAL_TZ} not found; run `pip install tzdata` in the venv.")
+    stored = None if force else stored_balance_for_day(conn, uid, today)
+    if stored is not None:
+        try:
+            amount = daily_allowance(stored, today)
+        except ValueError:
+            sys.exit("Stored balance for today is invalid; re-run with --force.")
+        print("Using balance already fetched today (use --force to fetch again).")
+    else:
+        try:
+            balance = fetch_account_balance(uid)
+            amount = daily_allowance(balance["balance_amount"]["amount"], today)
+            save_balance(conn, uid, balance, datetime.now(timezone.utc).isoformat())
+        except BalanceUnavailable as exc:
+            sys.exit(str(exc))
+        except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+            sys.exit(f"Could not fetch a valid balance ({type(exc).__name__}).")
 
     with requests.Session() as session:
         session.trust_env = False
         try:
             response = session.post(
                 f"{server.rstrip('/')}/{topic}",
-                data=f"You have {amount} for today".encode("utf-8"),
+                data=f"You have {amount} EUR for today".encode("utf-8"),
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=30,
                 allow_redirects=False,
@@ -312,7 +345,7 @@ def cmd_serve(args):
     HTTPServer((args.host, args.port), H).serve_forever()
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
 
@@ -327,14 +360,20 @@ def main():
 
     sp.add_parser("fetch").set_defaults(fn=cmd_fetch)
     sp.add_parser("latest").set_defaults(fn=cmd_latest)
-    sp.add_parser("notify").set_defaults(fn=cmd_notify)
+    n = sp.add_parser("notify")
+    n.add_argument("--force", action="store_true",
+                   help="fetch from the bank even if a balance was already fetched today")
+    n.set_defaults(fn=cmd_notify)
 
     s = sp.add_parser("serve")
     s.add_argument("--host", default="127.0.0.1", help="keep on localhost / Tailscale IP; don't bind 0.0.0.0")
     s.add_argument("--port", type=int, default=8787)
     s.set_defaults(fn=cmd_serve)
+    return p
 
-    args = p.parse_args()
+
+def main():
+    args = build_parser().parse_args()
     args.fn(args)
 
 

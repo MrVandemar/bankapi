@@ -1,9 +1,10 @@
+import argparse
 import contextlib
 import io
 import sqlite3
 import threading
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -60,6 +61,15 @@ class FetchTests(unittest.TestCase):
                          [("available", "10")])
 
 
+class ParserTests(unittest.TestCase):
+    def test_notify_force_flag(self):
+        parser = eb_balance.build_parser()
+        args = parser.parse_args(["notify"])
+        self.assertIs(args.fn, eb_balance.cmd_notify)
+        self.assertFalse(args.force)
+        self.assertTrue(parser.parse_args(["notify", "--force"]).force)
+
+
 class NotifyTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
@@ -85,8 +95,17 @@ class NotifyTests(unittest.TestCase):
             "balance_amount": {"amount": "100", "currency": "EUR"},
         }
 
+    def store(self, fetched_at, amount="100"):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO balance (uid, fetched_at, balance_type, amount, currency) "
+                "VALUES ('account-1', ?, 'CLAV', ?, 'EUR')", (fetched_at.isoformat(), amount))
+
+    def count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM balance").fetchone()[0]
+
     def notify(self, fetch_result=None, fetch_error=None, status=200, env=None,
-               mock_calculation=True):
+               mock_calculation=True, force=False):
         session = MagicMock()
         session.__enter__.return_value = session
         session.post.return_value.status_code = status
@@ -100,7 +119,7 @@ class NotifyTests(unittest.TestCase):
                 calculation, \
                 contextlib.redirect_stdout(io.StringIO()):
             try:
-                eb_balance.cmd_notify(None)
+                eb_balance.cmd_notify(argparse.Namespace(force=force))
                 error = None
             except SystemExit as exc:
                 error = str(exc)
@@ -112,7 +131,7 @@ class NotifyTests(unittest.TestCase):
         fetch.assert_called_once_with("account-1")
         session.post.assert_called_once_with(
             "http://127.0.0.1:2586/private-topic",
-            data=b"You have 5 for today",
+            data=b"You have 5 EUR for today",
             headers={"Authorization": "Bearer secret-token"},
             timeout=30,
             allow_redirects=False,
@@ -136,6 +155,76 @@ class NotifyTests(unittest.TestCase):
                 self.assertIsNotNone(error)
                 fetch.assert_not_called()
                 session.post.assert_not_called()
+
+    def test_balance_fetched_today_is_reused_without_bank_call(self):
+        self.store(datetime.now(timezone.utc), amount="100")
+        with patch.object(eb_balance, "daily_allowance", return_value=5) as calc:
+            fetch, session, error = self.notify(fetch_result=self.balance,
+                                                mock_calculation=False)
+        self.assertIsNone(error)
+        fetch.assert_not_called()
+        calc.assert_called_once()
+        self.assertEqual(calc.call_args.args[0], "100")
+        self.assertEqual(session.post.call_args.kwargs["data"], b"You have 5 EUR for today")
+        self.assertEqual(self.count(), 1)
+
+    def test_unreadable_stored_timestamp_is_ignored(self):
+        day = date(2026, 11, 10)
+        for fetched_at in ("not-a-date", "2026-11-10T08:00:00", None):
+            with self.subTest(fetched_at=fetched_at):
+                with self.conn:
+                    self.conn.execute("DELETE FROM balance")
+                    self.conn.execute(
+                        "INSERT INTO balance (uid, fetched_at, amount) VALUES ('account-1', ?, '1')",
+                        (fetched_at,))
+                self.assertIsNone(eb_balance.stored_balance_for_day(self.conn, "account-1", day))
+
+    def test_z_suffix_timestamp_is_accepted(self):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO balance (uid, fetched_at, amount) "
+                "VALUES ('account-1', '2026-11-10T08:00:00Z', '7')")
+        self.assertEqual(
+            eb_balance.stored_balance_for_day(self.conn, "account-1", date(2026, 11, 10)), "7")
+
+    def test_missing_timezone_data_exits_before_bank_call(self):
+        with patch.object(eb_balance, "ZoneInfo",
+                          side_effect=eb_balance.ZoneInfoNotFoundError("x")):
+            fetch, session, error = self.notify(fetch_result=self.balance)
+        self.assertIn("pip install tzdata", error)
+        fetch.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_balance_from_earlier_day_is_refetched(self):
+        self.store(datetime.now(timezone.utc) - timedelta(days=2))
+        fetch, session, error = self.notify(fetch_result=self.balance)
+        self.assertIsNone(error)
+        fetch.assert_called_once_with("account-1")
+        session.post.assert_called_once()
+        self.assertEqual(self.count(), 2)
+
+    def test_force_fetches_even_when_fetched_today(self):
+        self.store(datetime.now(timezone.utc))
+        fetch, session, error = self.notify(fetch_result=self.balance, force=True)
+        self.assertIsNone(error)
+        fetch.assert_called_once_with("account-1")
+        self.assertEqual(self.count(), 2)
+
+    def test_invalid_stored_balance_is_not_published(self):
+        self.store(datetime.now(timezone.utc), amount="NaN")
+        fetch, session, error = self.notify(mock_calculation=False)
+        self.assertIn("--force", error)
+        fetch.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_stored_balance_day_uses_bratislava_calendar(self):
+        # 2026-11-10 in Bratislava starts at 2026-11-09 23:00 UTC.
+        day = date(2026, 11, 10)
+        self.store(datetime(2026, 11, 9, 22, 30, tzinfo=timezone.utc), amount="1")
+        self.assertIsNone(eb_balance.stored_balance_for_day(self.conn, "account-1", day))
+        self.store(datetime(2026, 11, 9, 23, 10, tzinfo=timezone.utc), amount="2")
+        self.assertEqual(eb_balance.stored_balance_for_day(self.conn, "account-1", day), "2")
+        self.assertIsNone(eb_balance.stored_balance_for_day(self.conn, "other", day))
 
     def test_publish_failure_is_reported_without_retry(self):
         _, session, error = self.notify(fetch_result=self.balance, status=503)
@@ -180,7 +269,7 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(instant.astimezone(ZoneInfo("Europe/Bratislava")).date(),
                          date(2026, 11, 10))
         self.assertEqual(received, [("/private-topic", "Bearer secret-token",
-                                     b"You have 1 for today")])
+                                     b"You have 1 EUR for today")])
 
 
 if __name__ == "__main__":
